@@ -8,7 +8,9 @@ Sub2API Docker 在线一键部署辅助工具。
 
 ```
 ├── scripts/
-│   └── deploy-online.sh      # 在线一键部署脚本
+│   ├── deploy-online.sh      # 在线一键部署脚本
+│   ├── update-online.sh      # 已有部署的备份 + 友好更新脚本
+│   └── sync-vps-backups.sh   # 本机拉取/推送 VPS 备份脚本
 ├── docs/blog/
 │   └── blog-cn.md            # 完整部署教程
 └── readme.md                 # 本文件
@@ -96,6 +98,163 @@ ssh user@vps 'sed -i "s|SERVER_PORT=8080|SERVER_PORT=8088|" /tmp/deploy.sh && ba
 - 管理员邮箱：`admin@sub2api.local`
 - 管理员密码：脚本输出显示，或在日志中查看 `docker compose logs | grep 'admin password'`
 - **请立即修改默认密码**
+
+## 更新已有部署
+
+已有实例不要直接重跑 `deploy-online.sh`。部署脚本会重新生成 `.env` 中的数据库密码、JWT 密钥和 TOTP 加密密钥；对已有实例，推荐使用更新脚本：
+
+```bash
+cd sub2api-helper
+bash scripts/update-online.sh
+```
+
+脚本默认会：
+
+- 备份配置、`data/`、PostgreSQL 逻辑 dump、Redis `dump.rdb`
+- 拉取 `weishaw/sub2api:latest`
+- 只重建 `sub2api` 应用容器：`docker compose up -d --no-deps sub2api`
+- 不重启 PostgreSQL、Redis、Caddy、host-relay
+- 更新后轮询 `/health`，并打印容器状态和最近日志
+
+常用选项：
+
+```bash
+# 只备份，不更新
+bash scripts/update-online.sh --backup-only
+
+# 先等 8444/8080/8443 上没有活跃连接，再更新
+bash scripts/update-online.sh --wait-idle --max-active-connections 0
+
+# 自定义连接统计端口
+bash scripts/update-online.sh --wait-idle --active-ports 8444,8088
+
+# 指定部署目录和健康检查地址
+bash scripts/update-online.sh \
+  --data-dir /home/user/sub2api \
+  --health-url https://127.0.0.1:8444/health
+
+# 演练，不实际改动
+bash scripts/update-online.sh --dry-run
+```
+
+> 单实例 Docker 更新无法保证真正零中断。该脚本通过预备份、预拉镜像、只替换应用容器，把影响窗口压到应用容器重建和启动的几秒级。
+
+## 本机维护 VPS 备份
+
+如果你希望在本机长期保存 VPS 备份，或换 VPS 时从本机把历史备份推送到新机器，可以使用同步脚本：
+
+```bash
+# 查看 VPS 上已有备份
+bash scripts/sync-vps-backups.sh list \
+  --host your-vps-ip \
+  --user user \
+  --port 22
+
+# 在 VPS 上生成最新备份，并拉取到本机 ./sub2api-backups
+bash scripts/sync-vps-backups.sh pull \
+  --host your-vps-ip \
+  --user user \
+  --port 22
+
+# 只拉取已有备份，不在 VPS 上生成新备份
+bash scripts/sync-vps-backups.sh pull \
+  --host your-vps-ip \
+  --user user \
+  --port 22 \
+  --no-create
+
+# 把本机 ./sub2api-backups 里的备份推送到新 VPS 的 ~/sub2api-restore
+bash scripts/sync-vps-backups.sh push \
+  --host new-vps.example.com \
+  --user user \
+  --port 22
+```
+
+常用参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--local-dir` | `./sub2api-backups` | 本机备份目录 |
+| `--remote-backup-dir` | `~/sub2api-backups` | VPS 上保存备份的目录 |
+| `--remote-restore-dir` | `~/sub2api-restore` | `push` 时上传到 VPS 的恢复目录 |
+| `--remote-helper-dir` | `~/sub2api-helper` | VPS 上 helper 仓库目录，`pull` 默认会在这里执行备份脚本 |
+| `--remote-data-dir` | `~/sub2api` | VPS 上已有部署目录 |
+| `--dry-run` | 关闭 | 只打印将执行的 SSH / 传输命令 |
+
+说明：
+- `pull` 默认会先通过 SSH 在 VPS 上执行 `update-online.sh --backup-only`，再把 `sub2api-*` 备份文件拉到本机。
+- `push` 只上传备份文件到新 VPS 的恢复目录，不会自动导入数据库，也不会覆盖线上服务。
+- 优先使用 `rsync`；如果本机没有 `rsync`，脚本会回退到 `scp`。
+
+推荐维护节奏：
+- 日常维护：定期在本机执行 `pull`，让本机保留一份最新可恢复备份。
+- 换 VPS 前：先对旧 VPS 执行一次 `pull`，确认本机备份文件存在。
+- 新 VPS 准备好后：执行 `push` 把本机备份上传到新 VPS，再按下方恢复流程导入数据。
+
+## 更换 VPS / 恢复历史数据
+
+迁移到新 VPS 时，推荐先在旧 VPS 生成标准备份，再把备份文件传到新 VPS 恢复。**不要只复制 `data/` 目录**；`.env`、PostgreSQL 数据和证书挂载路径同样关键。
+
+### 旧 VPS：生成备份
+
+```bash
+cd sub2api-helper
+bash scripts/update-online.sh --backup-only --data-dir ~/sub2api
+ls -lh ~/sub2api-backups
+```
+
+需要带走的文件通常包括：
+
+| 文件 | 作用 |
+|------|------|
+| `sub2api-config-data-*.tar.gz` | `docker-compose.yml`、`.env`、`Caddyfile`、`data/` |
+| `sub2api-postgres-*.sql.gz` | PostgreSQL 逻辑备份，包含账号、渠道、Key、用量等核心数据 |
+| `sub2api-redis-*.rdb` | Redis 快照，建议一并迁移 |
+| HTTPS 证书目录 | 如果 `docker-compose.override.yml` 挂载了宿主机证书路径，例如 `/opt/dpconn/certs` |
+
+从本机推送到新 VPS 示例（先确保本机 `./sub2api-backups` 里已有旧 VPS 备份）：
+
+```bash
+bash scripts/sync-vps-backups.sh push \
+  --host new-vps.example.com \
+  --user user \
+  --port 22
+```
+
+### 新 VPS：恢复并启动
+
+先安装 Docker / Compose，或先运行一次 `deploy-online.sh` 让脚本安装依赖。若运行过空部署，请先停止并挪走空数据目录，避免和历史数据混用。
+
+```bash
+mkdir -p ~/sub2api ~/sub2api-restore
+cd ~/sub2api
+
+# 1. 恢复配置和 data/
+tar -xzf ~/sub2api-restore/sub2api-config-data-YYYYMMDD-HHMMSS.tar.gz
+
+# 2. 启动数据库和 Redis
+docker compose up -d postgres redis
+
+# 3. 等 PostgreSQL 就绪
+until docker exec sub2api-postgres pg_isready -U sub2api -d sub2api; do sleep 2; done
+
+# 4. 恢复 PostgreSQL
+gunzip -c ~/sub2api-restore/sub2api-postgres-YYYYMMDD-HHMMSS.sql.gz \
+  | docker exec -i sub2api-postgres psql -U sub2api -d sub2api
+
+# 5. 恢复 Redis（可选但推荐）
+docker compose stop redis
+docker cp ~/sub2api-restore/sub2api-redis-YYYYMMDD-HHMMSS.rdb sub2api-redis:/data/dump.rdb
+docker compose up -d redis
+
+# 6. 启动全部服务
+docker compose up -d
+
+# 7. 验证
+curl -ksS https://127.0.0.1:8444/health || curl -sS http://127.0.0.1:8080/health
+```
+
+如果 `.env` 中的 `POSTGRES_USER` / `POSTGRES_DB` 不是默认值，请把上面 `pg_isready`、`psql` 命令里的 `sub2api` 改成你的实际值。域名迁移后还要检查 DNS、安全组、防火墙端口，以及 HTTPS 证书路径是否和 `docker-compose.override.yml` 中的挂载一致。
 
 ## 配置说明
 
